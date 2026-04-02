@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+openai>=2.0.0
+python-dotenv
+boto3
+pandas>=2.0.0
+openpyxl>=3.1.2
+google-genai
+pdf2image
+pillow
