@@ -91,8 +91,8 @@ def run_getpdfinfo(payload: Dict[str, Any]) -> Dict[str, Any]:
         f = f.strip()
         if not f:
             raise ValueError(f"payload.files[{i}] が空です")
-        if not f.startswith("s3://"):
-            raise ValueError(f"payload.files[{i}] は s3:// 形式ではありません: {f}")
+        if not f.startswith("gs://"):
+            raise ValueError(f"payload.files[{i}] は gs:// 形式ではありません: {f}")
         normalized.append(f)
 
     normalized_names: list[str] = []

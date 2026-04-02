@@ -19,8 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-import boto3
-from botocore.client import Config
+from google.cloud import storage as gcs_storage
 from pdf2image import convert_from_path
 from zoneinfo import ZoneInfo
 
@@ -297,42 +296,30 @@ def build_display_text(result_json: dict) -> str:
 
 
 # ────────────────────────────────
-# S3 / ファイル補助
+# GCS / ファイル補助
 # ────────────────────────────────
-def _parse_s3_url(url: str) -> Tuple[str, str]:
-    if not url.startswith("s3://"):
-        raise ValueError(f"s3:// 形式ではありません: {url}")
-    rest = url[len("s3://") :]
+def _parse_gcs_url(url: str) -> Tuple[str, str]:
+    if not url.startswith("gs://"):
+        raise ValueError(f"gs:// 形式ではありません: {url}")
+    rest = url[len("gs://"):]
     if "/" not in rest:
-        raise ValueError(f"s3://bucket/key 形式ではありません: {url}")
+        raise ValueError(f"gs://bucket/key 形式ではありません: {url}")
     bucket, key = rest.split("/", 1)
     return bucket, key
 
 
-def download_s3_to_dir(s3_urls: List[str], out_dir: Path) -> List[Path]:
-    access_key = str(os.environ.get("S3_ACCESS_KEY") or os.environ.get("AWS_ACCESS_KEY_ID") or "").strip()
-    secret_key = str(os.environ.get("S3_SECRET_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY") or "").strip()
-    region = str(os.environ.get("S3_REGION") or os.environ.get("AWS_REGION") or "ap-northeast-1").strip()
-
-    if not access_key or not secret_key:
-        raise ValueError("S3 credentials が未指定です。環境変数 S3_ACCESS_KEY / S3_SECRET_KEY を指定してください。")
-
-    client = boto3.client(
-        "s3",
-        region_name=region,
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-        config=Config(signature_version="s3v4"),
-    )
-
+def download_gcs_to_dir(gcs_urls: List[str], out_dir: Path) -> List[Path]:
+    client = gcs_storage.Client()
     local_paths: List[Path] = []
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for url in s3_urls:
-        bucket, key = _parse_s3_url(url)
+    for url in gcs_urls:
+        bucket_name, key = _parse_gcs_url(url)
         filename = Path(key).name or "input.pdf"
         local_path = out_dir / filename
-        client.download_file(bucket, key, str(local_path))
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(key)
+        blob.download_to_filename(str(local_path))
         local_paths.append(local_path)
 
     return local_paths
@@ -383,9 +370,9 @@ def get_pdf_page_count(pdf_path: str) -> int:
     return len(pages)
 
 
-def _s3_display_name_from_url(url: str) -> str:
+def _gcs_display_name_from_url(url: str) -> str:
     try:
-        _, key = _parse_s3_url(url)
+        _, key = _parse_gcs_url(url)
         return Path(key).name
     except Exception:
         return Path(url).name or url
@@ -400,14 +387,14 @@ def _build_display_name_map(files: List[str], file_names: List[str] | None) -> D
     if not file_names:
         return mapping
 
-    for i, s3_url in enumerate(files):
+    for i, gcs_url in enumerate(files):
         if i >= len(file_names):
             break
         original = (file_names[i] or "").strip()
         if not original:
             continue
-        s3_name = _s3_display_name_from_url(s3_url)
-        mapping[_strip_pdf_suffix(s3_name)] = _strip_pdf_suffix(Path(original).name)
+        gcs_name = _gcs_display_name_from_url(gcs_url)
+        mapping[_strip_pdf_suffix(gcs_name)] = _strip_pdf_suffix(Path(original).name)
     return mapping
 
 
@@ -642,24 +629,19 @@ def run_getpdfinfo(files: List[str], file_names: List[str] | None = None) -> Dic
         reason = str(item.get("reason", "") or "").strip()
         extra = "アップロードファイルが1件のみで、同一PDF内に年度が2要素あるため、labels を『今期』『前期』に補正"
         item["reason"] = f"{reason} / {extra}" if reason else extra
+    gcs_client = gcs_storage.Client()
     for url in files:
-        display_name = _s3_display_name_from_url(url)
+        display_name = _gcs_display_name_from_url(url)
         try:
-            bucket, key = _parse_s3_url(url)
-            s3_client = boto3.client(
-                "s3",
-                region_name=str(os.environ.get("S3_REGION") or os.environ.get("AWS_REGION") or "ap-northeast-1").strip(),
-                aws_access_key_id=str(os.environ.get("S3_ACCESS_KEY") or os.environ.get("AWS_ACCESS_KEY_ID") or "").strip(),
-                aws_secret_access_key=str(os.environ.get("S3_SECRET_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY") or "").strip(),
-                config=Config(signature_version="s3v4"),
-            )
-            head = s3_client.head_object(Bucket=bucket, Key=key)
-            size_mb = (head.get("ContentLength", 0) or 0) / 1024 / 1024
+            bucket_name, key = _parse_gcs_url(url)
+            blob = gcs_client.bucket(bucket_name).blob(key)
+            blob.reload()
+            size_mb = (blob.size or 0) / 1024 / 1024
             log(f"📄 {display_name} を転送中... ({size_mb:.1f}MB)")
         except Exception:
             log(f"📄 {display_name} を転送中...")
 
-    pdf_paths = download_s3_to_dir(files, in_dir)
+    pdf_paths = download_gcs_to_dir(files, in_dir)
     display_name_map = _build_display_name_map(files, file_names)
 
     actual_file_names: List[str] = []

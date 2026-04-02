@@ -15,9 +15,9 @@ def health():
 def _is_getpdfinfo_payload(payload: Dict[str, Any]) -> bool:
     files = payload.get("files") or payload.get("file")
     if isinstance(files, str):
-        return files.startswith("s3://")
+        return files.startswith("gs://")
     if isinstance(files, list) and len(files) > 0:
-        return all(isinstance(x, str) and x.startswith("s3://") for x in files)
+        return all(isinstance(x, str) and x.startswith("gs://") for x in files)
     return False
 
 
@@ -45,11 +45,11 @@ def pipeline(payload: Dict[str, Any] = Body(...)):
         raise HTTPException(
             status_code=400,
             detail={
-                "message": "payload.files に s3://... のPDF配列を指定してください。",
+                "message": "payload.files に gs://... のPDF配列を指定してください。",
                 "example": {
                     "files": [
-                        "s3://zlite/sample-1.pdf",
-                        "s3://zlite/sample-2.pdf"
+                        "gs://analygent/getpdfinfo/sample-1.pdf",
+                        "gs://analygent/getpdfinfo/sample-2.pdf"
                     ]
                 }
             }
