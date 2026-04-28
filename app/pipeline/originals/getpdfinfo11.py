@@ -1,15 +1,16 @@
 """
-getpdfinfo11.new.py (Cloud Run / API互換版)
+getpdfinfo11.py (Cloud Run / API互換版)
 
 目的:
 - getpdfinfo11.py の run_getpdfinfo() と同じ入出力に寄せる
-- ただし判定ロジックは getpdfinfo11.new.py の「複数PDFを1回でGeminiへ送る」方式を使う
+- ただし判定ロジックは「複数PDFを1回でOpenAIへ送る」方式を使う
 - apimessage も getpdfinfo11.py と同様に記録する
 - reason を result_json に必ず含める
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -19,14 +20,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from google.cloud import storage as gcs_storage
 from pdf2image import convert_from_path
 from zoneinfo import ZoneInfo
 
 # NOTE:
 # This repository contains a local "/app/google" stub package for old Colab helpers.
-# It shadows the real "google-genai" package on Cloud Run, so we must import
-# google.genai only after temporarily removing the project root from sys.path.
+# google.cloud.storage は GCS ダウンロードに引き続き使用するため、
+# プロジェクトルートをsys.pathから一時的に除外して正しくインポートする。
 import importlib
 import sys
 
@@ -44,15 +44,15 @@ _google_mod = sys.modules.get("google")
 if _google_mod is not None and str(getattr(_google_mod, "__file__", "")).startswith(_PROJECT_ROOT + "/google"):
     del sys.modules["google"]
 
-genai = importlib.import_module("google.genai")
-genai_types = importlib.import_module("google.genai.types")
+gcs_storage = importlib.import_module("google.cloud.storage")
 
 for _p in reversed(_removed_sys_path):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import openai as _openai_module
 
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 
 
 # ────────────────────────────────
@@ -67,7 +67,7 @@ def _format_apimessage(msg: str) -> str:
 
 
 # ────────────────────────────────
-# Geminiプロンプト
+# プロンプト
 # ────────────────────────────────
 def build_meta_prompt(pdf_infos: list) -> str:
     """
@@ -162,7 +162,7 @@ PDF一覧:
 
 
 # ────────────────────────────────
-# Gemini API: JSON抽出ヘルパー（リトライ付き）
+# OpenAI API: JSON抽出ヘルパー（リトライ付き）
 # ────────────────────────────────
 def _extract_json_text(text: str) -> str:
     text = text.strip()
@@ -173,7 +173,7 @@ def _extract_json_text(text: str) -> str:
     return text
 
 
-def _call_gemini_json(client: genai.Client, contents: list, max_tokens: int = 4000) -> dict:
+def _call_openai_json(client: _openai_module.OpenAI, messages: list, max_tokens: int = 4000) -> dict:
     import time as _time
 
     MAX_RETRIES = 3
@@ -181,58 +181,51 @@ def _call_gemini_json(client: genai.Client, contents: list, max_tokens: int = 40
 
     for attempt in range(MAX_RETRIES):
         try:
-            response = client.models.generate_content(
+            response = client.chat.completions.create(
                 model=MODEL,
-                contents=contents,
-                config=genai_types.GenerateContentConfig(
-                    temperature=0.0,
-                    max_output_tokens=max_tokens,
-                    response_mime_type="application/json",
-                ),
+                messages=messages,
+                temperature=0.0,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
             )
 
             text = None
             try:
-                text = response.text
+                text = response.choices[0].message.content
             except Exception:
                 pass
 
             if not text:
-                try:
-                    text = response.candidates[0].content.parts[0].text
-                except Exception:
-                    pass
-
-            if not text:
-                raise ValueError("Gemini APIレスポンス取得失敗")
+                raise ValueError("OpenAI APIレスポンス取得失敗")
 
             text = _extract_json_text(text)
             data = json.loads(text)
 
             if not isinstance(data, dict):
-                raise ValueError("GeminiのJSON応答がdictではありません")
+                raise ValueError("OpenAIのJSON応答がdictではありません")
 
             if "results" not in data or not isinstance(data["results"], list):
-                raise ValueError("GeminiのJSON応答に results がありません")
+                raise ValueError("OpenAIのJSON応答に results がありません")
 
             return data
 
         except Exception as e:
             last_err = e
             wait = 2 ** attempt
-            print(f"[WARN] Gemini API retry {attempt + 1}/{MAX_RETRIES}: {e}")
+            print(f"[WARN] OpenAI API retry {attempt + 1}/{MAX_RETRIES}: {e}")
             _time.sleep(wait)
 
-    raise RuntimeError(f"Gemini API {MAX_RETRIES}回失敗: {last_err}")
+    raise RuntimeError(f"OpenAI API {MAX_RETRIES}回失敗: {last_err}")
 
 
 # ────────────────────────────────
 # PDFまとめ解析
 # ────────────────────────────────
-def analyze_multiple_pdfs_with_gemini(client: genai.Client, pdf_paths: list, file_names: list) -> dict:
+def analyze_multiple_pdfs_with_openai(client: _openai_module.OpenAI, pdf_paths: list, file_names: list) -> dict:
     """
-    すべてのPDFをまとめて1回でGeminiへ送る。
+    すべてのPDFをまとめて1回でOpenAIへ送る。
     PDF番号・ファイル名を明示することで、どのPDFがどの判定かを安定化する。
+    PDFはbase64エンコードしてfile inputとして送信する。
     """
     if len(pdf_paths) != len(file_names):
         raise ValueError("pdf_paths と file_names の数が一致しません")
@@ -245,25 +238,34 @@ def analyze_multiple_pdfs_with_gemini(client: genai.Client, pdf_paths: list, fil
         })
 
     prompt = build_meta_prompt(pdf_infos)
-    contents = [prompt]
+
+    # ユーザーメッセージのcontentを構築
+    content_parts: list = [{"type": "text", "text": prompt}]
 
     for i, pdf_path in enumerate(pdf_paths, start=1):
         file_name = file_names[i - 1]
-        contents.append(f"以下が PDF{i} / ファイル名: {file_name} です。")
+        content_parts.append({
+            "type": "text",
+            "text": f"以下が PDF{i} / ファイル名: {file_name} です。",
+        })
 
         with open(pdf_path, "rb") as f:
             pdf_bytes = f.read()
 
-        contents.append(
-            genai_types.Part(
-                inline_data=genai_types.Blob(
-                    mime_type="application/pdf",
-                    data=pdf_bytes,
-                )
-            )
-        )
+        b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+        content_parts.append({
+            "type": "file",
+            "file": {
+                "filename": file_name,
+                "file_data": f"data:application/pdf;base64,{b64}",
+            },
+        })
 
-    result = _call_gemini_json(client, contents)
+    messages = [
+        {"role": "user", "content": content_parts},
+    ]
+
+    result = _call_openai_json(client, messages)
 
     results = result.get("results", [])
     results = sorted(results, key=lambda x: x.get("pdf_index", 9999))
@@ -566,7 +568,7 @@ def build_period_mapping_from_result(result_json: Dict[str, Any]) -> List[Dict[s
                 "fiscal_period_name": year_text,
                 "file_name": file_name,
                 "column_header": "",
-                "detection_basis": "gemini_total_judgement",
+                "detection_basis": "openai_total_judgement",
                 "reason": reason,
             })
 
@@ -589,11 +591,11 @@ def run_getpdfinfo(files: List[str], file_names: List[str] | None = None) -> Dic
         "period_mapping": ...
     }
     """
-    api_key = str(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
+    api_key = str(os.environ.get("OPENAI_API_KEY") or "").strip()
     if not api_key:
-        raise ValueError("Gemini APIキーが未指定です。環境変数 GEMINI_API_KEY を指定してください。")
+        raise ValueError("OpenAI APIキーが未指定です。環境変数 OPENAI_API_KEY を指定してください。")
 
-    client = genai.Client(api_key=api_key)
+    client = _openai_module.OpenAI(api_key=api_key)
 
     run_dir = Path(tempfile.mkdtemp(prefix="zlite_getpdfinfo_new_", dir="/tmp"))
     in_dir = run_dir / "input"
@@ -658,9 +660,9 @@ def run_getpdfinfo(files: List[str], file_names: List[str] | None = None) -> Dic
     ]
 
     log("🚀 解析開始...")
-    log("📨 Geminiへ全PDFを一括送信します")
+    log("📨 OpenAIへ全PDFを一括送信します")
 
-    result_json = analyze_multiple_pdfs_with_gemini(client, [str(p) for p in pdf_paths], send_file_names)
+    result_json = analyze_multiple_pdfs_with_openai(client, [str(p) for p in pdf_paths], send_file_names)
 
     # フィールド正規化
     for item in result_json.get("results", []) or []:
