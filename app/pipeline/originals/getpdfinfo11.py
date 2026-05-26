@@ -660,7 +660,7 @@ def run_getpdfinfo(files: List[str], file_names: List[str] | None = None) -> Dic
     ]
 
     log("🚀 解析開始...")
-    log("📨 OpenAIへ全PDFを一括送信します")
+    log("📨 AIへ全PDFを一括送信します")
 
     result_json = analyze_multiple_pdfs_with_openai(client, [str(p) for p in pdf_paths], send_file_names)
 
